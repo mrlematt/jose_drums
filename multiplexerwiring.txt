@@ -1,0 +1,242 @@
+BELA GEM STEREO - MULTIPLEXER WIRING GUIDE
+===========================================
+
+OVERVIEW
+--------
+
+Add 16 buttons + 8 knobs using only:
+- 5 GPIO pins (3 for mux, 2 for I2C)
+- No additional analog inputs needed
+- I2C + analog mux setup
+
+
+HARDWARE NEEDED
+===============
+
+1. MCP23017 I2C Expander (~$3)
+   - 16 digital I/O via I2C
+   - Breakout board available
+
+2. 4051 Analog Multiplexer (~$1)
+   - 8-to-1 analog input selector
+   - 3 control pins (S0, S1, S2)
+
+3. 16 pushbuttons
+4. 8 potentiometers (10k recommended)
+5. 16 resistors (10k) for pull-ups (if buttons not debounced)
+6. Capacitors for debouncing (optional, 100nF)
+
+
+WIRING DIAGRAM
+==============
+
+DIGITAL INPUTS (MCP23017):
+--------------------------
+
+Bela Gem Stereo pinout (P9 header, looking at top of board):
+
+  P9 pin 17 (SCL) ──┐
+  P9 pin 18 (SDA) ──┤
+  GND ──────────────┤
+  3.3V ─────────────┤
+                    │
+                MCP23017
+                ├─────────────────────┐
+                │ VDD = 3.3V          │
+                │ VSS = GND           │
+                │ SCL = P9_17         │
+                │ SDA = P9_18         │
+                │                     │
+                │ A0-A7 (Port A) ◄── Buttons
+                │ B0-B7 (Port B) ◄── More buttons
+                └─────────────────────┘
+
+Button wiring (example for A0):
+  
+  3.3V ──[10k]──┬── MCP A0
+                │
+              [Button]
+                │
+               GND
+
+ANALOG INPUTS (4051 Mux):
+------------------------
+
+Bela Gem Stereo analog inputs:
+
+  Analog 0 (Bela) ◄── 4051 output (pin Y, ~pin 3)
+  
+4051 control pins (GPIO):
+
+  GPIO 71 ── 4051 S0 (pin 11)
+  GPIO 72 ── 4051 S1 (pin 10)
+  GPIO 73 ── 4051 S2 (pin 9)
+  
+  GND ──── 4051 GND (pins 8)
+  3.3V ─── 4051 VDD (pin 16)
+
+Pot wiring (for each of 8 channels):
+
+  3.3V ──[10k pot]── 4051 channel (C0-C7, pins 13,14,15,12,1,5,2,4)
+           │
+          GND
+
+
+COMPLETE PINOUT TABLE
+=====================
+
+BELA GEM STEREO:
+
+P9 Header (top row):
+  P9_01  P9_02  P9_03  P9_04  P9_05  P9_06  P9_07  P9_08
+  GND    GND    3.3V   3.3V   GND    GND    GND    GND
+
+P9 Header (bottom row):
+  P9_17  P9_18  ... (I2C pins)
+  SCL    SDA
+
+Analog inputs: 0-7 (J2 connector)
+GPIO pins: 0-127 (various)
+
+
+GPIO MAPPING IN RENDER.CPP
+==========================
+
+// 4051 mux control pins
+int muxPin_S0 = 71;   // GPIO number 71
+int muxPin_S1 = 72;   // GPIO number 72
+int muxPin_S2 = 73;   // GPIO number 73
+
+// Analog input reading mux
+int muxAnalogInput = 0;  // Analog pin 0
+
+// I2C bus
+int i2cBus = 1;         // BeagleBone I2C bus 1 (P9_17/P9_18)
+
+
+PARAMETER MAPPING IN RNBO
+=========================
+
+Map these parameters in your RNBO patcher:
+
+Digital (buttons via MCP23017):
+  tap_tempo      ← MCP A0
+  record_btn     ← MCP A1
+  clear_btn      ← MCP A2
+  voice0_trigger ← MCP A3
+  voice1_trigger ← MCP A4
+  voice2_trigger ← MCP A5
+  
+  (You have 10 more pins available: A6, A7, B0-B7)
+
+Analog (knobs via 4051 mux):
+  master_volume  ← Mux channel 0 (pot connected to C0)
+  click_volume   ← Mux channel 1 (pot connected to C1)
+  decay_v0       ← Mux channel 2
+  decay_v1       ← Mux channel 3
+  decay_v2       ← Mux channel 4
+  
+  (You have 3 more channels available: 5, 6, 7)
+
+
+STEP-BY-STEP SETUP
+==================
+
+1. Build RNBO patch with parameters:
+   - Create [param] objects for each control
+   - Name them exactly as in render.cpp
+   - Test in Max/RNBO before exporting
+
+2. Export from RNBO:
+   File → Export for Max (C++ option)
+   Get: rnbo_source.cpp, rnbo_source.h
+
+3. Set up Bela project:
+   - Copy render.cpp template (provided)
+   - Copy rnbo_source.* files
+   - Update #include in render.cpp if needed
+
+4. Wire hardware:
+   - MCP23017 to P9_17/P9_18 (I2C)
+   - 4051 to GPIO 71/72/73 + Analog 0
+   - Buttons to MCP23017 pins
+   - Pots to 4051 channels
+
+5. Compile:
+   make
+
+6. Deploy to Bela:
+   - Upload via Bela IDE
+   - Check console for "Initialized" message
+
+
+BUTTON DEBOUNCING
+=================
+
+If buttons are noisy, add debouncing in render.cpp:
+
+  static unsigned int debounceCounter = 0;
+  
+  if (digitalState & (1 << BTN_TAP_TEMPO)) {
+    debounceCounter++;
+    if (debounceCounter > 5) {  // 5 blocks = ~80ms at 48kHz, blocksize 16
+      tap_tempo_pressed = true;
+      debounceCounter = 0;
+    }
+  } else {
+    debounceCounter = 0;
+  }
+
+
+TESTING
+=======
+
+In Bela IDE console, add debug output:
+
+  rt_printf("Button state: 0x%04X\n", digitalState);
+  rt_printf("Analog ch%d: %.3f\n", muxReadCounter % 8, muxSample);
+
+Monitor to verify:
+- Buttons send rising edges
+- Pots track smoothly
+- No glitches
+
+
+TROUBLESHOOTING
+===============
+
+"I2C error" 
+  → Check SCL/SDA wiring to P9_17/P9_18
+  → Verify MCP23017 address (default 0x20, check solder bridges)
+  → Add pull-up resistors if needed (4.7k to 3.3V)
+
+"Buttons don't work"
+  → Check button wiring (GND side correct?)
+  → Verify MCP pins are set as inputs (IODIRA/IODIRB = 0xFF)
+  → Test with LED on MCP pin to confirm it's reading
+
+"Analog values noisy"
+  → Longer wires? → Add capacitor at 4051 output (10nF to GND)
+  → Add capacitor across pot (100nF)
+  → Increase mux settle time (add delay after setMuxChannel)
+
+"GPIO 71/72/73 doesn't exist"
+  → Check Bela Gem pinout, may need different GPIO numbers
+  → Use actual BeagleBone GPIO numbering
+
+
+OPTIONAL IMPROVEMENTS
+=====================
+
+1. Add second MCP23017 (address 0x21) for 32 buttons total
+
+2. Add second 4051 mux on different analog input for 16 knobs
+
+3. Add debounce capacitors (100nF) across buttons
+
+4. Use shift registers (74HC595) instead of MCP for cheaper button expansion
+   (but less convenient, requires more code)
+
+5. Integrate encoder for menu navigation:
+   → Use I2C or quadrature on GPIO
+
