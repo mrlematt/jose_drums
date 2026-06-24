@@ -1,0 +1,68 @@
+@state last_button = 0;
+@state tap_times = new FixedInt32Array(10);
+@state tap_count = 0;
+@state current_bpm = 120;
+@state sample_counter = 0;
+@state last_tap_sample = 0;
+
+// Increment counter every sample
+sample_counter += 1;
+
+// Reset tap_count if no tap for 1 second (samplerate() samples)
+let timeout = samplerate();
+if ((sample_counter - last_tap_sample) > timeout) {
+  tap_count = 0;
+}
+
+// Detect rising edge on button
+let button_now = in1 > 0.5 ? 1 : 0;
+let rising_edge = (button_now > 0.5) && (last_button < 0.5);
+
+if (rising_edge) {
+  // Record when this tap happened
+  last_tap_sample = sample_counter;
+  
+  // Store this tap time
+  if (tap_count < 10) {
+    tap_times[tap_count] = sample_counter;
+    tap_count += 1;
+  } else {
+    // Shift old taps left, add new one
+    for (let i = 0; i < 9; i++) {
+      tap_times[i] = tap_times[i + 1];
+    }
+    tap_times[9] = sample_counter;
+  }
+  
+  // Calculate BPM if we have 2+ taps
+  if (tap_count >= 2) {
+    let total = 0;
+    let count = tap_count - 1;
+    
+    for (let i = 0; i < count; i++) {
+      total += (tap_times[i + 1] - tap_times[i]);
+    }
+    
+    let avg_samples = total / count;
+    let avg_ms = (avg_samples / samplerate()) * 1000;
+    
+    if (avg_ms > 0) {
+      let bpm = round(60000 / avg_ms);
+      
+      // Clamp 20-240
+      if (bpm < 20) bpm = 20;
+      if (bpm > 240) bpm = 240;
+      
+      current_bpm = bpm;
+    }
+  }
+}
+
+let interval_ms = round(60000 / current_bpm);
+  let frequency_hz = current_bpm / 60;
+  
+  out2 = interval_ms;  // Output interval in milliseconds
+  out3 = frequency_hz; // Output frequency in Hz
+
+last_button = button_now;
+out1 = current_bpm;
