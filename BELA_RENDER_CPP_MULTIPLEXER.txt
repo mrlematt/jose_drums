@@ -1,0 +1,259 @@
+// BELA RENDER.CPP - RNBO DRUM MACHINE WITH MULTIPLEXERS
+// Integrate RNBO-exported code + MCP23017 (I2C buttons) + 4051 analog mux (knobs)
+
+#include <Bela.h>
+#include <libraries/Gpio/Gpio.h>
+#include <libraries/math_neon/math_neon.h>
+#include "RNBO.h"
+
+// ============================================================================
+// MCP23017 I2C EXPANDER (16 digital inputs)
+// ============================================================================
+
+#define MCP23017_ADDR 0x20       // Default I2C address
+#define MCP23017_GPIOA 0x12      // Register for Port A (8 pins)
+#define MCP23017_GPIOB 0x13      // Register for Port B (8 pins)
+#define MCP23017_IODIRA 0x00     // IO direction A (0=output, 1=input)
+#define MCP23017_IODIRB 0x01     // IO direction B
+#define MCP23017_IOCON 0x0A      // IO control register
+
+int i2cBus = 1;                  // BeagleBone I2C bus 1
+int i2cAddress = MCP23017_ADDR;
+
+// ============================================================================
+// ANALOG MULTIPLEXER 4051 (8 analog inputs on 1 pin)
+// ============================================================================
+
+// Control pins for 4051 mux (3 pins for 8 channels: 2^3 = 8)
+int muxPin_S0 = 71;   // GPIO for select line S0
+int muxPin_S1 = 72;   // GPIO for select line S1
+int muxPin_S2 = 73;   // GPIO for select line S2
+
+int muxAnalogInput = 0;  // Which analog input reads the mux output (0-7)
+int muxChannel = 0;      // Current channel being read (0-7)
+int muxReadCounter = 0;  // Counter for round-robin reading
+
+// ============================================================================
+// RNBO CONTEXT
+// ============================================================================
+
+RNBO::CoreObject rnboObject;
+const size_t blockSize = 16;  // Standard block size
+
+// ============================================================================
+// PARAMETER MAPPING (adjust these for your setup)
+// ============================================================================
+
+// Digital inputs (via MCP23017)
+#define BTN_TAP_TEMPO    0   // MCP pin A0
+#define BTN_RECORD       1   // MCP pin A1
+#define BTN_CLEAR        2   // MCP pin A2
+#define BTN_VOICE_0      3   // MCP pin A3
+#define BTN_VOICE_1      4   // MCP pin A4
+#define BTN_VOICE_2      5   // MCP pin A5
+// ... more buttons available (up to 16 total)
+
+// Analog inputs (via 4051 mux)
+#define POT_MASTER_VOL   0   // Mux channel 0
+#define POT_CLICK_VOL    1   // Mux channel 1
+#define POT_DECAY_0      2   // Mux channel 2 (voice 0)
+#define POT_DECAY_1      3   // Mux channel 3 (voice 1)
+#define POT_DECAY_2      4   // Mux channel 4 (voice 2)
+// ... more pots available (up to 8 total)
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+// Set MCP23017 control register (configure as inputs)
+void initMCP23017() {
+  unsigned char buf[2];
+  
+  // Set all Port A pins as inputs
+  buf[0] = MCP23017_IODIRA;
+  buf[1] = 0xFF;  // 1 = input
+  i2c_write_blocking(i2cBus, i2cAddress, buf, 2, true);
+  
+  // Set all Port B pins as inputs
+  buf[0] = MCP23017_IODIRB;
+  buf[1] = 0xFF;
+  i2c_write_blocking(i2cBus, i2cAddress, buf, 2, true);
+  
+  rt_printf("MCP23017 initialized at I2C address 0x%02X\n", i2cAddress);
+}
+
+// Read all 16 digital inputs from MCP23017
+uint16_t readMCP23017() {
+  unsigned char buf[2] = {0};
+  uint8_t portA, portB;
+  
+  // Read Port A
+  i2c_write_blocking(i2cBus, i2cAddress, &(unsigned char){MCP23017_GPIOA}, 1, false);
+  i2c_read_blocking(i2cBus, i2cAddress, &portA, 1, true);
+  
+  // Read Port B
+  i2c_write_blocking(i2cBus, i2cAddress, &(unsigned char){MCP23017_GPIOB}, 1, false);
+  i2c_read_blocking(i2cBus, i2cAddress, &portB, 1, true);
+  
+  // Combine: portB is high byte, portA is low byte
+  return (portB << 8) | portA;
+}
+
+// Set multiplexer channel (S0, S1, S2 pins)
+void setMuxChannel(int channel) {
+  // channel is 0-7 (3 bits needed)
+  digitalWriteFixed(gBCM2835_GPIO, muxPin_S0, (channel & 0x01) ? HIGH : LOW);
+  digitalWriteFixed(gBCM2835_GPIO, muxPin_S1, (channel & 0x02) ? HIGH : LOW);
+  digitalWriteFixed(gBCM2835_GPIO, muxPin_S2, (channel & 0x04) ? HIGH : LOW);
+}
+
+// ============================================================================
+// BELA CALLBACKS
+// ============================================================================
+
+bool setup(BelaContext *context, void *userData) {
+  // Initialize RNBO
+  RNBO::prepareToProcess(context->sampleRate, blockSize);
+  rnboObject.prepareToProcess(context->sampleRate, blockSize);
+  
+  // Initialize I2C for MCP23017
+  initMCP23017();
+  
+  // Initialize GPIO for 4051 multiplexer
+  pinMode(context, 0, muxPin_S0, OUTPUT);
+  pinMode(context, 0, muxPin_S1, OUTPUT);
+  pinMode(context, 0, muxPin_S2, OUTPUT);
+  setMuxChannel(0);  // Start at channel 0
+  
+  rt_printf("Bela RNBO Drum Machine initialized\n");
+  rt_printf("- MCP23017 I2C buttons: 16 digital inputs\n");
+  rt_printf("- 4051 Analog mux: 8 analog inputs\n");
+  
+  return true;
+}
+
+void render(BelaContext *context, void *userData) {
+  // ========================================================================
+  // READ HARDWARE INPUTS
+  // ========================================================================
+  
+  // Read digital inputs (MCP23017) - 16 buttons
+  static uint16_t lastDigitalState = 0;
+  uint16_t digitalState = readMCP23017();
+  uint16_t digitalEdges = digitalState ^ lastDigitalState;  // Rising edges
+  lastDigitalState = digitalState;
+  
+  // Detect rising edges on specific buttons
+  bool tap_tempo_pressed = (digitalEdges & (1 << BTN_TAP_TEMPO)) && (digitalState & (1 << BTN_TAP_TEMPO));
+  bool record_pressed = (digitalEdges & (1 << BTN_RECORD)) && (digitalState & (1 << BTN_RECORD));
+  bool clear_pressed = (digitalEdges & (1 << BTN_CLEAR)) && (digitalState & (1 << BTN_CLEAR));
+  bool voice0_pressed = (digitalEdges & (1 << BTN_VOICE_0)) && (digitalState & (1 << BTN_VOICE_0));
+  bool voice1_pressed = (digitalEdges & (1 << BTN_VOICE_1)) && (digitalState & (1 << BTN_VOICE_1));
+  bool voice2_pressed = (digitalEdges & (1 << BTN_VOICE_2)) && (digitalState & (1 << BTN_VOICE_2));
+  
+  // Read analog inputs (round-robin through 4051 mux channels)
+  // Sample one channel per block (8 channels = 8 blocks to read all)
+  static float analogValues[8] = {0};
+  
+  setMuxChannel(muxReadCounter % 8);
+  // Small delay for mux to settle (handled by block processing time)
+  float muxSample = analogRead(context, 0, muxAnalogInput);
+  analogValues[muxReadCounter % 8] = muxSample;
+  muxReadCounter++;
+  
+  // Normalized values (0-1)
+  float masterVol = analogValues[POT_MASTER_VOL];
+  float clickVol = analogValues[POT_CLICK_VOL];
+  float decay0 = analogValues[POT_DECAY_0];
+  float decay1 = analogValues[POT_DECAY_1];
+  float decay2 = analogValues[POT_DECAY_2];
+  
+  // ========================================================================
+  // SEND INPUTS TO RNBO
+  // ========================================================================
+  
+  // Set RNBO parameters based on hardware inputs
+  rnboObject.setParameterValue(rnboObject.getParameterIndex("tap_tempo"), 
+                                tap_tempo_pressed ? 1.0 : 0.0);
+  rnboObject.setParameterValue(rnboObject.getParameterIndex("record_btn"), 
+                                record_pressed ? 1.0 : 0.0);
+  rnboObject.setParameterValue(rnboObject.getParameterIndex("clear_btn"), 
+                                clear_pressed ? 1.0 : 0.0);
+  rnboObject.setParameterValue(rnboObject.getParameterIndex("voice0_trigger"), 
+                                voice0_pressed ? 1.0 : 0.0);
+  rnboObject.setParameterValue(rnboObject.getParameterIndex("voice1_trigger"), 
+                                voice1_pressed ? 1.0 : 0.0);
+  rnboObject.setParameterValue(rnboObject.getParameterIndex("voice2_trigger"), 
+                                voice2_pressed ? 1.0 : 0.0);
+  
+  // Set continuous parameters (knobs)
+  rnboObject.setParameterValue(rnboObject.getParameterIndex("master_volume"), masterVol);
+  rnboObject.setParameterValue(rnboObject.getParameterIndex("click_volume"), clickVol);
+  rnboObject.setParameterValue(rnboObject.getParameterIndex("decay_v0"), decay0);
+  rnboObject.setParameterValue(rnboObject.getParameterIndex("decay_v1"), decay1);
+  rnboObject.setParameterValue(rnboObject.getParameterIndex("decay_v2"), decay2);
+  
+  // ========================================================================
+  // PROCESS AUDIO WITH RNBO
+  // ========================================================================
+  
+  // Prepare input/output buffers
+  float *audioInputs[context->audioInChannels];
+  float *audioOutputs[context->audioOutChannels];
+  
+  for (unsigned int ch = 0; ch < context->audioInChannels; ch++) {
+    audioInputs[ch] = context->audioIn + ch * context->audioFrames;
+  }
+  for (unsigned int ch = 0; ch < context->audioOutChannels; ch++) {
+    audioOutputs[ch] = context->audioOut + ch * context->audioFrames;
+  }
+  
+  // Process blocks
+  for (unsigned int i = 0; i < context->audioFrames; i += blockSize) {
+    rnboObject.process(audioInputs, context->audioInChannels,
+                       audioOutputs, context->audioOutChannels,
+                       blockSize);
+  }
+}
+
+void cleanup(BelaContext *context, void *userData) {
+}
+
+// ============================================================================
+// HOW TO USE:
+// ============================================================================
+//
+// 1. Export RNBO patch as C++ (File → Export for max)
+// 2. Copy "rnbo_source.cpp" and "rnbo_source.h" to Bela project
+// 3. Include them in this render.cpp:
+//    #include "rnbo_source.h"
+//
+// 4. In your RNBO patcher, create parameters:
+//    - tap_tempo (0-1, bang)
+//    - record_btn (0-1)
+//    - clear_btn (0-1)
+//    - voice0/1/2_trigger (0-1)
+//    - master_volume (0-1)
+//    - click_volume (0-1)
+//    - decay_v0/1/2 (0-1)
+//
+// 5. HARDWARE WIRING:
+//
+//    I2C (buttons):
+//      Bela P9_17 (SCL) → MCP23017 SCL
+//      Bela P9_18 (SDA) → MCP23017 SDA
+//      Bela GND → MCP23017 GND
+//      Bela 3.3V → MCP23017 VDD
+//      Buttons: GND ← button → MCP23017 pin (A0-B7)
+//
+//    Analog Mux (knobs):
+//      Bela GPIO 71 → 4051 S0
+//      Bela GPIO 72 → 4051 S1
+//      Bela GPIO 73 → 4051 S2
+//      Bela Analog 0 ← 4051 output (pin Y)
+//      Pots: 3.3V ← knob ← 4051 channels (C0-C7) ← GND
+//
+// 6. Compile and run:
+//    make
+//
+// ============================================================================
